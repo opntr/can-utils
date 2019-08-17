@@ -152,13 +152,6 @@ static unsigned char binary_gap;
 static unsigned char color;
 static char interface[4*(COLSTRSZ+IFNAMSIZ)];
 
-void print_snifline(canid_t id);
-int handle_keyb(int fd);
-int handle_raw(int fd, long currcms);
-int handle_timeo(int fd, long currcms);
-void writesettings(char* name);
-void readsettings(char* name, int sockfd);
-
 void print_usage(char *prg)
 {
 	const char manual [] = {
@@ -212,185 +205,87 @@ void sigterm(int signo)
 	running = 0;
 }
 
-int main(int argc, char **argv)
-{
-	fd_set rdfs;
-	int s;
-	int num_ifaces = 0;
-	canid_t mask = 0;
-	canid_t value = 0;
-	long currcms = 0;
-	long lastcms = 0;
-	unsigned char quiet = 0;
-	int opt, ret;
-	const int canfd_on = 1;
-	struct timeval timeo, start_tv, tv;
-	struct sockaddr_can addr;
-	int i;
+void writesettings(char* name){
 
+	int fd;
+	char fname[30] = SETFNAME;
+	int i,j;
+	char buf[8]= {0};
 
-	signal(SIGTERM, sigterm);
-	signal(SIGHUP, sigterm);
-	signal(SIGINT, sigterm);
+	strncat(fname, name, 29 - strlen(fname));
+	fd = open(fname,  O_WRONLY|O_CREAT, S_IRUSR|S_IWUSR|S_IRGRP|S_IROTH);
 
-	for (i=0; i < 2048 ;i++) /* default: check all CAN-IDs */
-		do_set(i, ENABLE);
+	if (fd > 0) {
 
-	while ((opt = getopt(argc, argv, "m:v:r:t:h:l:qebBcf?")) != -1) {
-		switch (opt) {
-		case 'm':
-			sscanf(optarg, "%x", &mask);
-			break;
-
-		case 'v':
-			sscanf(optarg, "%x", &value);
-			break;
-
-		case 'r':
-			readsettings(optarg, 0); /* no BCM-setting here */
-			break;
-
-		case 't':
-			sscanf(optarg, "%ld", &timeout);
-			break;
-
-		case 'h':
-			sscanf(optarg, "%ld", &hold);
-			break;
-
-		case 'l':
-			sscanf(optarg, "%ld", &loop);
-			break;
-
-		case 'q':
-			quiet = 1;
-			break;
-
-		case 'e':
-			print_eff = 1;
-			break;
-
-		case 'b':
-			binary = 1;
-			binary_gap = 0;
-			break;
-
-		case 'B':
-			binary = 1;
-			binary_gap = 1;
-			break;
-
-		case 'c':
-			color = 1;
-			break;
-
-		case 'f':
-			filter_id_only = 1;
-			break;
-
-		case '?':
-			break;
-
-		default:
-			fprintf(stderr, "Unknown option %c\n", opt);
-			break;
+		for (i=0; i < 2048 ;i++) {
+			sprintf(buf, "<%03X>%c.", i, (is_set(i, ENABLE))?'1':'0');
+			if (write(fd, buf, 7) < 0)
+				perror("write");
+			for (j=0; j<8 ; j++){
+				sprintf(buf, "%02X", sniftab[i].notch.data[j]);
+				if (write(fd, buf, 2) < 0)
+					perror("write");
+			}
+			if (write(fd, "\n", 1) < 0)
+				perror("write");
+			/* 7 + 16 + 1 = 24 bytes per entry */
 		}
+		close(fd);
 	}
+	else
+		printf("unable to write setting file '%s'!\n", fname);
+};
 
-	num_ifaces = argc - optind;
-	if ((optind == argc) || (num_ifaces > MAX_IFACE)) {
-		print_usage(basename(argv[0]));
-		exit(0);
-	}
-	
-	/* fill interface table with up to MAX_IFACE interfaces */
-	for (i=0; i < num_ifaces; i++) {
-		if (strlen(argv[optind+i]) > IFNAMSIZ-1) {
-			printf("name of CAN device '%s' is too long!\n", argv[optind+i]);
-			return 1;
+void readsettings(char* name, int sockfd){
+
+	int fd;
+	char fname[30] = SETFNAME;
+	char buf[25] = {0};
+	int i,j;
+
+	strncat(fname, name, 29 - strlen(fname));
+	fd = open(fname, O_RDONLY);
+
+	if (fd > 0) {
+		if (!sockfd)
+			printf("reading setting file '%s' ... ", fname);
+
+		for (i=0; i < 2048 ;i++) {
+			if (read(fd, &buf, 24) == 24) {
+				if (buf[5] & 1) {
+					if (is_clr(i, ENABLE)) {
+						do_set(i, ENABLE);
+						//if (sockfd)
+							//rx_setup(sockfd, i);
+					}
+				}
+				else
+					if (is_set(i, ENABLE)) {
+						do_clr(i, ENABLE);
+						//if (sockfd)
+							//rx_delete(sockfd, i);
+					}
+				for (j=7; j>=0 ; j--){
+					sniftab[i].notch.data[j] =
+						(__u8) strtoul(&buf[2*j+7], (char **)NULL, 16) & 0xFF;
+					buf[2*j+7] = 0; /* cut off each time */
+				}
+			}
+			else {
+				if (!sockfd)
+					printf("was only able to read until index %d from setting file '%s'!\n",
+					       i, fname);
+			}
 		}
 
-		strcpy(ifacetab[i].ifname, argv[optind+i]);
-		ifacetab[i].ifindex = if_nametoindex(ifacetab[i].ifname);
-		if (!ifacetab[i].ifindex) {
-			printf("CAN device '%s' is not available!\n", argv[optind+i]);
-			return 1;
-		}
+		if (!sockfd)
+			printf("done\n");
+
+		close(fd);
 	}
-
-	if (num_ifaces > 1) {
-		for (i=0; i < num_ifaces; i++) {
-			snprintf(ifacetab[i].colorstr, COLSTRSZ, "%s", col_on[i]);
-			strcat(interface, ifacetab[i].colorstr);
-			strcat(interface, ifacetab[i].ifname);
-			strcat(interface, " " ATTRESET);
-		}
-	} else
-		sprintf(interface, "%s ", ifacetab[0].ifname);
-
-	s = socket(PF_CAN, SOCK_RAW, CAN_RAW);
-	if (s < 0) {
-		perror("socket");
-		return 1;
-	}
-
-	addr.can_family = AF_CAN;
-	addr.can_ifindex = 0; /* any can interface */
-
-	/* try to switch the socket into CAN FD mode */
-	setsockopt(s, SOL_CAN_RAW, CAN_RAW_FD_FRAMES, &canfd_on, sizeof(canfd_on));
-
-	if (bind(s, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-		perror("connect");
-		return 1;
-	}
-
-#if 0
-	for (i=0; i < 2048 ;i++) /* initial BCM setup */
-		if (is_set(i, ENABLE))
-			rx_setup(s, i);
-#endif
-
-	gettimeofday(&start_tv, NULL);
-	tv.tv_sec = tv.tv_usec = 0;
-
-	printf("%s", CSR_HIDE); /* hide cursor */
-
-	while (running) {
-
-		FD_ZERO(&rdfs);
-		FD_SET(0, &rdfs);
-		FD_SET(s, &rdfs);
-
-		timeo.tv_sec  = 0;
-		timeo.tv_usec = 10000 * loop;
-
-		if ((ret = select(s+1, &rdfs, NULL, NULL, &timeo)) < 0) {
-			//perror("select");
-			running = 0;
-			continue;
-		}
-
-		gettimeofday(&tv, NULL);
-		currcms = (tv.tv_sec - start_tv.tv_sec) * 100 + (tv.tv_usec / 10000);
-
-		if (FD_ISSET(0, &rdfs))
-			running &= handle_keyb(s);
-
-		if (FD_ISSET(s, &rdfs))
-			running &= handle_raw(s, currcms);
-
-		if (currcms - lastcms >= loop) {
-			running &= handle_timeo(s, currcms);
-			lastcms = currcms;
-		}
-	}
-
-	printf("%s", CSR_SHOW); /* show cursor */
-
-	close(s);
-	return 0;
-}
+	else
+		printf("unable to read setting file '%s'!\n", fname);
+};
 
 int handle_keyb(int fd){
 
@@ -529,72 +424,6 @@ int handle_raw(int fd, long currcms){
 	return 1; /* ok */
 };
 
-int handle_timeo(int fd, long currcms){
-
-	int i, j;
-	int force_redraw = 0;
-	static unsigned int frame_count;
-
-	if (clearscreen) {
-
-		if (print_eff)
-			printf("%s%sXX|ms  -- ID --  data ...     < %s# l=%ld h=%ld t=%ld >",
-			       CLR_SCREEN, CSR_HOME, interface, loop, hold, timeout);
-		else
-			printf("%s%sXX|ms  ID   data ...     < %s# l=%ld h=%ld t=%ld >",
-			       CLR_SCREEN, CSR_HOME, interface, loop, hold, timeout);
-
-		force_redraw = 1;
-		clearscreen = 0;
-	}
-
-	if (notch) {
-		for (i=0; i < 2048; i++) {
-			for (j=0; j < 8; j++)
-				sniftab[i].notch.data[j] |= sniftab[i].marker.data[j];
-		}
-		notch = 0;
-	}
-
-	printf("%s", CSR_HOME);
-	printf("%02d\n", frame_count++); /* rolling display update counter */
-	frame_count %= 100;
-
-	for (i=0; i < 2048; i++) {
-
-		if is_set(i, ENABLE) {
-
-				if is_set(i, DISPLAY) {
-
-						if (is_set(i, UPDATE) || (force_redraw)){
-							print_snifline(i);
-							sniftab[i].hold = currcms + hold;
-							do_clr(i, UPDATE);
-						}
-						else
-							if ((sniftab[i].hold) && (sniftab[i].hold < currcms)) {
-								memset(&sniftab[i].marker.data, 0, 8);
-								print_snifline(i);
-								sniftab[i].hold = 0; /* disable update by hold */
-							}
-							else
-								printf("%s", CSR_DOWN); /* skip my line */
-
-						if (sniftab[i].timeout && sniftab[i].timeout < currcms) {
-							do_clr(i, DISPLAY);
-							do_clr(i, UPDATE);
-							clearscreen = 1; /* removed entry -> new drawing next time */
-						}
-					}
-				sniftab[i].last      = sniftab[i].current;
-				sniftab[i].laststamp = sniftab[i].currstamp;
-			}
-	}
-
-	return 1; /* ok */
-
-};
-
 void print_snifline(canid_t id){
 
 	long diffsec  = sniftab[id].currstamp.tv_sec  - sniftab[id].laststamp.tv_sec;
@@ -684,85 +513,248 @@ void print_snifline(canid_t id){
 	memset(&sniftab[id].marker.data, 0, 8);
 };
 
+int handle_timeo(int fd, long currcms){
 
-void writesettings(char* name){
+	int i, j;
+	int force_redraw = 0;
+	static unsigned int frame_count;
 
-	int fd;
-	char fname[30] = SETFNAME;
-	int i,j;
-	char buf[8]= {0};
+	if (clearscreen) {
 
-	strncat(fname, name, 29 - strlen(fname)); 
-	fd = open(fname,  O_WRONLY|O_CREAT, S_IRUSR|S_IWUSR|S_IRGRP|S_IROTH);
-    
-	if (fd > 0) {
+		if (print_eff)
+			printf("%s%sXX|ms  -- ID --  data ...     < %s# l=%ld h=%ld t=%ld >",
+			       CLR_SCREEN, CSR_HOME, interface, loop, hold, timeout);
+		else
+			printf("%s%sXX|ms  ID   data ...     < %s# l=%ld h=%ld t=%ld >",
+			       CLR_SCREEN, CSR_HOME, interface, loop, hold, timeout);
 
-		for (i=0; i < 2048 ;i++) {
-			sprintf(buf, "<%03X>%c.", i, (is_set(i, ENABLE))?'1':'0');
-			if (write(fd, buf, 7) < 0)
-				perror("write");
-			for (j=0; j<8 ; j++){
-				sprintf(buf, "%02X", sniftab[i].notch.data[j]);
-				if (write(fd, buf, 2) < 0)
-					perror("write");
-			}
-			if (write(fd, "\n", 1) < 0)
-				perror("write");
-			/* 7 + 16 + 1 = 24 bytes per entry */ 
-		}
-		close(fd);
+		force_redraw = 1;
+		clearscreen = 0;
 	}
-	else
-		printf("unable to write setting file '%s'!\n", fname);
+
+	if (notch) {
+		for (i=0; i < 2048; i++) {
+			for (j=0; j < 8; j++)
+				sniftab[i].notch.data[j] |= sniftab[i].marker.data[j];
+		}
+		notch = 0;
+	}
+
+	printf("%s", CSR_HOME);
+	printf("%02d\n", frame_count++); /* rolling display update counter */
+	frame_count %= 100;
+
+	for (i=0; i < 2048; i++) {
+
+		if is_set(i, ENABLE) {
+
+				if is_set(i, DISPLAY) {
+
+						if (is_set(i, UPDATE) || (force_redraw)){
+							print_snifline(i);
+							sniftab[i].hold = currcms + hold;
+							do_clr(i, UPDATE);
+						}
+						else
+							if ((sniftab[i].hold) && (sniftab[i].hold < currcms)) {
+								memset(&sniftab[i].marker.data, 0, 8);
+								print_snifline(i);
+								sniftab[i].hold = 0; /* disable update by hold */
+							}
+							else
+								printf("%s", CSR_DOWN); /* skip my line */
+
+						if (sniftab[i].timeout && sniftab[i].timeout < currcms) {
+							do_clr(i, DISPLAY);
+							do_clr(i, UPDATE);
+							clearscreen = 1; /* removed entry -> new drawing next time */
+						}
+					}
+				sniftab[i].last      = sniftab[i].current;
+				sniftab[i].laststamp = sniftab[i].currstamp;
+			}
+	}
+
+	return 1; /* ok */
+
 };
 
-void readsettings(char* name, int sockfd){
+int main(int argc, char **argv)
+{
+	fd_set rdfs;
+	int s;
+	int num_ifaces = 0;
+	canid_t mask = 0;
+	canid_t value = 0;
+	long currcms = 0;
+	long lastcms = 0;
+	unsigned char quiet = 0;
+	int opt, ret;
+	const int canfd_on = 1;
+	struct timeval timeo, start_tv, tv;
+	struct sockaddr_can addr;
+	int i;
 
-	int fd;
-	char fname[30] = SETFNAME;
-	char buf[25] = {0};
-	int i,j;
 
-	strncat(fname, name, 29 - strlen(fname)); 
-	fd = open(fname, O_RDONLY);
-    
-	if (fd > 0) {
-		if (!sockfd)
-			printf("reading setting file '%s' ... ", fname);
+	signal(SIGTERM, sigterm);
+	signal(SIGHUP, sigterm);
+	signal(SIGINT, sigterm);
 
-		for (i=0; i < 2048 ;i++) {
-			if (read(fd, &buf, 24) == 24) {
-				if (buf[5] & 1) {
-					if (is_clr(i, ENABLE)) {
-						do_set(i, ENABLE);
-						//if (sockfd)
-							//rx_setup(sockfd, i);
-					}
-				}
-				else
-					if (is_set(i, ENABLE)) {
-						do_clr(i, ENABLE);
-						//if (sockfd)
-							//rx_delete(sockfd, i);
-					}
-				for (j=7; j>=0 ; j--){
-					sniftab[i].notch.data[j] =
-						(__u8) strtoul(&buf[2*j+7], (char **)NULL, 16) & 0xFF;
-					buf[2*j+7] = 0; /* cut off each time */
-				}
-			}
-			else {
-				if (!sockfd)
-					printf("was only able to read until index %d from setting file '%s'!\n",
-					       i, fname);
-			}
+	for (i=0; i < 2048 ;i++) /* default: check all CAN-IDs */
+		do_set(i, ENABLE);
+
+	while ((opt = getopt(argc, argv, "m:v:r:t:h:l:qebBcf?")) != -1) {
+		switch (opt) {
+		case 'm':
+			sscanf(optarg, "%x", &mask);
+			break;
+
+		case 'v':
+			sscanf(optarg, "%x", &value);
+			break;
+
+		case 'r':
+			readsettings(optarg, 0); /* no BCM-setting here */
+			break;
+
+		case 't':
+			sscanf(optarg, "%ld", &timeout);
+			break;
+
+		case 'h':
+			sscanf(optarg, "%ld", &hold);
+			break;
+
+		case 'l':
+			sscanf(optarg, "%ld", &loop);
+			break;
+
+		case 'q':
+			quiet = 1;
+			break;
+
+		case 'e':
+			print_eff = 1;
+			break;
+
+		case 'b':
+			binary = 1;
+			binary_gap = 0;
+			break;
+
+		case 'B':
+			binary = 1;
+			binary_gap = 1;
+			break;
+
+		case 'c':
+			color = 1;
+			break;
+
+		case 'f':
+			filter_id_only = 1;
+			break;
+
+		case '?':
+			break;
+
+		default:
+			fprintf(stderr, "Unknown option %c\n", opt);
+			break;
 		}
-    
-		if (!sockfd)
-			printf("done\n");
-
-		close(fd);
 	}
-	else
-		printf("unable to read setting file '%s'!\n", fname);
-};
+
+	num_ifaces = argc - optind;
+	if ((optind == argc) || (num_ifaces > MAX_IFACE)) {
+		print_usage(basename(argv[0]));
+		exit(0);
+	}
+
+	/* fill interface table with up to MAX_IFACE interfaces */
+	for (i=0; i < num_ifaces; i++) {
+		if (strlen(argv[optind+i]) > IFNAMSIZ-1) {
+			printf("name of CAN device '%s' is too long!\n", argv[optind+i]);
+			return 1;
+		}
+
+		strcpy(ifacetab[i].ifname, argv[optind+i]);
+		ifacetab[i].ifindex = if_nametoindex(ifacetab[i].ifname);
+		if (!ifacetab[i].ifindex) {
+			printf("CAN device '%s' is not available!\n", argv[optind+i]);
+			return 1;
+		}
+	}
+
+	if (num_ifaces > 1) {
+		for (i=0; i < num_ifaces; i++) {
+			snprintf(ifacetab[i].colorstr, COLSTRSZ, "%s", col_on[i]);
+			strcat(interface, ifacetab[i].colorstr);
+			strcat(interface, ifacetab[i].ifname);
+			strcat(interface, " " ATTRESET);
+		}
+	} else
+		sprintf(interface, "%s ", ifacetab[0].ifname);
+
+	s = socket(PF_CAN, SOCK_RAW, CAN_RAW);
+	if (s < 0) {
+		perror("socket");
+		return 1;
+	}
+
+	addr.can_family = AF_CAN;
+	addr.can_ifindex = 0; /* any can interface */
+
+	/* try to switch the socket into CAN FD mode */
+	setsockopt(s, SOL_CAN_RAW, CAN_RAW_FD_FRAMES, &canfd_on, sizeof(canfd_on));
+
+	if (bind(s, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+		perror("connect");
+		return 1;
+	}
+
+#if 0
+	for (i=0; i < 2048 ;i++) /* initial BCM setup */
+		if (is_set(i, ENABLE))
+			rx_setup(s, i);
+#endif
+
+	gettimeofday(&start_tv, NULL);
+	tv.tv_sec = tv.tv_usec = 0;
+
+	printf("%s", CSR_HIDE); /* hide cursor */
+
+	while (running) {
+
+		FD_ZERO(&rdfs);
+		FD_SET(0, &rdfs);
+		FD_SET(s, &rdfs);
+
+		timeo.tv_sec  = 0;
+		timeo.tv_usec = 10000 * loop;
+
+		if ((ret = select(s+1, &rdfs, NULL, NULL, &timeo)) < 0) {
+			//perror("select");
+			running = 0;
+			continue;
+		}
+
+		gettimeofday(&tv, NULL);
+		currcms = (tv.tv_sec - start_tv.tv_sec) * 100 + (tv.tv_usec / 10000);
+
+		if (FD_ISSET(0, &rdfs))
+			running &= handle_keyb(s);
+
+		if (FD_ISSET(s, &rdfs))
+			running &= handle_raw(s, currcms);
+
+		if (currcms - lastcms >= loop) {
+			running &= handle_timeo(s, currcms);
+			lastcms = currcms;
+		}
+	}
+
+	printf("%s", CSR_SHOW); /* show cursor */
+
+	close(s);
+	return 0;
+}
